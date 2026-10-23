@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Exporter
 // @namespace    https://chatgpt.com/
-// @version      3.0.0
+// @version      3.1.0
 // @description  Export ChatGPT live conversations and shared conversations as JSON or Markdown.
 // @author       OpenAI ChatGPT
 // @match        https://chatgpt.com/*
@@ -16,10 +16,20 @@
   const APP_ID = 'chatgpt-conversation-exporter-v3';
   const PANEL_ID = `${APP_ID}-panel`;
   const STYLE_ID = `${APP_ID}-style`;
-  const ROLE_SELECTOR = [
-    '[data-message-author-role="user"]',
-    '[data-message-author-role="assistant"]'
-  ].join(',');
+  const MESSAGE_SELECTOR_GROUPS = [
+    {
+      user: '[data-content-search-unit-key$=":user"]',
+      assistant: '[data-content-search-unit-key$=":assistant"]'
+    },
+    {
+      user: '[data-chatgpt-search-unit-key$=":user"]',
+      assistant: '[data-chatgpt-search-unit-key$=":assistant"]'
+    },
+    {
+      user: '[data-message-author-role="user"]',
+      assistant: '[data-message-author-role="assistant"]'
+    }
+  ];
 
   // Avoid duplicate initialization if the userscript is manually re-run.
   if (window.__chatgptConversationExporterV3?.destroy) {
@@ -64,25 +74,58 @@
     return style.display !== 'none' && style.visibility !== 'hidden' && node.getClientRects().length > 0;
   }
 
+  function roleForNode(node) {
+    const explicitRole = node.getAttribute('data-message-author-role');
+    if (explicitRole === 'user' || explicitRole === 'assistant') return explicitRole;
+
+    const unitKey =
+      node.getAttribute('data-content-search-unit-key') ||
+      node.getAttribute('data-chatgpt-search-unit-key') ||
+      '';
+    const match = unitKey.match(/:(user|assistant)$/);
+    return match?.[1] || null;
+  }
+
   function getRoleNodes() {
-    return [...document.querySelectorAll(ROLE_SELECTOR)]
-      .filter(node => {
-        if (!isVisible(node)) return false;
-        // Keep only the outermost role element to avoid nested duplicates.
-        const parentRole = node.parentElement?.closest('[data-message-author-role]');
-        return !parentRole;
-      });
+    const nodes = [];
+
+    for (const role of ['user', 'assistant']) {
+      for (const group of MESSAGE_SELECTOR_GROUPS) {
+        const selector = group[role];
+        const candidates = [...document.querySelectorAll(selector)]
+          .filter(isVisible)
+          // Keep only the outermost match from the selected DOM generation.
+          .filter(node => !node.parentElement?.closest(selector));
+
+        if (candidates.length > 0) {
+          nodes.push(...candidates);
+          break;
+        }
+      }
+    }
+
+    return nodes.sort((a, b) => {
+      if (a === b) return 0;
+      const position = a.compareDocumentPosition(b);
+      if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+      return 0;
+    });
   }
 
   function contentRoot(roleNode, role) {
     const selectors = role === 'assistant'
       ? [
+          '[data-markdown-text-style="assistant-message"]',
           '[data-message-content]',
           '.markdown',
           '.prose',
+          '[class*="MarkdownRoot"]',
           '[class*="markdown"]'
         ]
       : [
+          '[data-user-message-bubble="true"]',
+          '[data-markdown-text-tone="user-message"]',
           '[data-message-content]',
           '.whitespace-pre-wrap',
           '[class*="whitespace-pre-wrap"]'
@@ -108,6 +151,7 @@
       '[data-testid*="copy"]',
       '[data-testid*="feedback"]',
       '[data-testid*="branch"]',
+      '[data-markdown-copy="exclude"]',
       '[aria-label*="Copy"]',
       '[aria-label*="复制"]',
       '[aria-label*="Good response"]',
@@ -124,23 +168,67 @@
   }
 
   function stableIdentity(roleNode, role, domOrdinal) {
-    const turn = roleNode.closest('[data-testid^="conversation-turn-"]');
-    const turnId = turn?.getAttribute('data-testid') || '';
-    const turnMatch = turnId.match(/conversation-turn-(\d+)/);
+    const legacyTurn = roleNode.closest('[data-testid^="conversation-turn-"]');
+    const legacyTurnId = legacyTurn?.getAttribute('data-testid') || '';
+    const legacyTurnMatch = legacyTurnId.match(/conversation-turn-(\d+)/);
 
-    const messageNode = roleNode.closest('[data-message-id], [data-message-uuid], [id]');
-    const messageId =
-      roleNode.getAttribute('data-message-id') ||
-      roleNode.getAttribute('data-message-uuid') ||
-      messageNode?.getAttribute('data-message-id') ||
-      messageNode?.getAttribute('data-message-uuid') ||
+    const unitKey =
+      roleNode.getAttribute('data-content-search-unit-key') ||
+      roleNode.getAttribute('data-chatgpt-search-unit-key') ||
       '';
+    const unitMatch = unitKey.match(/(?:^|-)turn-(\d+):(\d+):(user|assistant)$/);
+    const searchTurnKey = roleNode
+      .closest('[data-content-search-turn-key]')
+      ?.getAttribute('data-content-search-turn-key') || '';
+    const searchTurnMatch = searchTurnKey.match(/(?:^|-)turn-(\d+)$/);
 
-    if (turnId) {
+    const messageCarrier =
+      roleNode.closest('[data-chatgpt-search-message-ids]') ||
+      roleNode.querySelector('[data-chatgpt-search-message-ids]');
+    const selectionMessage = roleNode.querySelector('[data-chatgpt-selection-message-id]');
+    const legacyMessage =
+      roleNode.closest('[data-message-id], [data-message-uuid]') ||
+      roleNode.querySelector('[data-message-id], [data-message-uuid]');
+    const messageIds = [
+      roleNode.getAttribute('data-message-id'),
+      roleNode.getAttribute('data-message-uuid'),
+      selectionMessage?.getAttribute('data-chatgpt-selection-message-id'),
+      legacyMessage?.getAttribute('data-message-id'),
+      legacyMessage?.getAttribute('data-message-uuid'),
+      ...(messageCarrier?.getAttribute('data-chatgpt-search-message-ids') || '')
+        .split(/\s+/)
+    ].filter(Boolean);
+    const uniqueMessageIds = [...new Set(messageIds)];
+    const messageId = uniqueMessageIds[uniqueMessageIds.length - 1] || '';
+
+    const turnIndex = unitMatch
+      ? Number(unitMatch[1])
+      : searchTurnMatch
+        ? Number(searchTurnMatch[1])
+        : legacyTurnMatch
+          ? Number(legacyTurnMatch[1])
+          : null;
+    const unitIndex = unitMatch ? Number(unitMatch[2]) : null;
+    const order = turnIndex === null
+      ? domOrdinal
+      : unitIndex === null
+        ? turnIndex
+        : turnIndex * 1000 + unitIndex;
+
+    if (unitKey) {
       return {
-        key: `turn:${turnId}:${role}`,
-        order: turnMatch ? Number(turnMatch[1]) : domOrdinal,
-        turnIndex: turnMatch ? Number(turnMatch[1]) : null,
+        key: `unit:${unitKey}`,
+        order,
+        turnIndex,
+        messageId: messageId || null
+      };
+    }
+
+    if (legacyTurnId) {
+      return {
+        key: `turn:${legacyTurnId}:${role}`,
+        order,
+        turnIndex,
         messageId: messageId || null
       };
     }
@@ -148,18 +236,16 @@
     if (messageId) {
       return {
         key: `message:${messageId}:${role}`,
-        order: domOrdinal,
-        turnIndex: null,
+        order,
+        turnIndex,
         messageId
       };
     }
 
-    // On current ChatGPT pages, conversation-turn-* is normally available.
-    // This fallback remains stable while messages append to a non-virtualized DOM.
     return {
       key: `ordinal:${role}:${domOrdinal}`,
-      order: domOrdinal,
-      turnIndex: null,
+      order,
+      turnIndex,
       messageId: null
     };
   }
@@ -170,7 +256,7 @@
     const roleNodes = getRoleNodes();
 
     roleNodes.forEach((roleNode, domOrdinal) => {
-      const role = roleNode.getAttribute('data-message-author-role');
+      const role = roleForNode(roleNode);
       if (role !== 'user' && role !== 'assistant') return;
 
       const root = contentRoot(roleNode, role);
@@ -606,7 +692,7 @@
     } else {
       setStatus(
         '<b>尚未识别到消息</b><br>' +
-        `role 节点：${document.querySelectorAll('[data-message-author-role]').length}`
+        `消息节点：${getRoleNodes().length}`
       );
     }
 
@@ -720,11 +806,17 @@
     state.observer?.disconnect();
     state.observer = new MutationObserver(mutations => {
       if (!isSupportedPath()) return;
-      const meaningful = mutations.some(mutation =>
-        mutation.type === 'characterData' ||
-        mutation.addedNodes.length > 0 ||
-        mutation.removedNodes.length > 0
-      );
+      const meaningful = mutations.some(mutation => {
+        const target = mutation.target instanceof Element
+          ? mutation.target
+          : mutation.target.parentElement;
+        if (target?.closest(`#${PANEL_ID}`)) return false;
+        return (
+          mutation.type === 'characterData' ||
+          mutation.addedNodes.length > 0 ||
+          mutation.removedNodes.length > 0
+        );
+      });
       if (meaningful) scheduleCollect(100);
     });
     state.observer.observe(document.body, {
